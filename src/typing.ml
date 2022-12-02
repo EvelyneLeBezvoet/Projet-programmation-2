@@ -29,7 +29,7 @@ let rec eq_type ty1 ty2 = match ty1, ty2 with                  (*sert à vérifi
   | Tstruct s1, Tstruct s2 -> s1 == s2
   | Tptr ty1, Tptr ty2 -> eq_type ty1 ty2
   | Tmany [], Tmany [] -> true
-  | Tmany t1::q1, Tmany t2::q2 -> (t1 == t2) && eq_type (Tmany q1) (Tmany q2) 
+  | Tmany (t1::q1), Tmany (t2::q2) -> (t1 == t2) && eq_type (Tmany q1) (Tmany q2) 
   | _ -> false
 
     (* TODO autres types *)
@@ -40,8 +40,8 @@ let fmt_imported = ref false
 let evar v = { expr_desc = TEident v; expr_typ = v.v_typ }
 
 let new_var =
-  let id = ref 0 in
-  fun x loc ?(used=false) ty ->
+  let id = ref 0 in    (*sert à numéroter les variables d'un bloc*)
+  fun x loc ?(used=false) ty -> (*à l'initialisation de la variable, elle n'a pas encore été utilisée => used = false*)
     incr id;
     { v_name = x; v_id = !id; v_loc = loc; v_typ = ty; v_used = used; v_addr = 0; v_depth = 0 }
 

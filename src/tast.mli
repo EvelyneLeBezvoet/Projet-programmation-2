@@ -30,7 +30,7 @@ and structure = {
 and typ =
   | Tint | Tbool | Tstring
   | Tstruct of structure
-  | Tptr of typ
+  | Tptr of typ (*type pointeur*)
   | Twild (* type wildcard, tout type *)
   | Tmany of typ list (* 0 pour type retour instructions et >=2 pour retour functions *)
   (* TODO autres types pour l'analyse semantique, si besoin *)
