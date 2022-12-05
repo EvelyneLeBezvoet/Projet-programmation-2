@@ -55,7 +55,7 @@ module Env = struct
   let all_vars = ref []
   let check_unused () =
     let check v =
-      if v.v_name <> "_" && (* TODO used *) true then error v.v_loc "unused variable" in
+      if v.v_name <> "_" && (* TODO used *) !(v.v_used) = false then error v.v_loc "unused variable" in
     List.iter check !all_vars
 
 
@@ -68,8 +68,8 @@ module Env = struct
 end
 
 let tvoid = Tmany []
-let make d ty = { expr_desc = d; expr_typ = ty }
-let stmt d = make d tvoid
+let make d ty = { expr_desc = d; expr_typ = ty }  (*correspond à {expression x de TAST; type de x}*)
+let stmt d = make d tvoid (*correspond à {expression x de TAST; tvoid = absence de type pour l'instant}*)
 
 let rec expr env e =
  let e, ty, rt = expr_desc env e.pexpr_loc e.pexpr_desc in
@@ -79,15 +79,24 @@ and expr_desc env loc = function
   | PEskip ->
      TEskip, tvoid, false
   | PEconstant c ->
-    (* TODO *) TEconstant c, tvoid, false
-  | PEbinop (op, e1, e2) ->
+    (* TODO *) TEconstant c, 
+                 (match c with 
+                  |Cbool x -> Tbool 
+                  |Cint x -> Tint
+                  |Cstring x -> Tstring), 
+                 false
+  | PEbinop (op, e1, e2) -> let a1 = (List.map (fst expr) e1) and a2 = (List.map (fst expr) e2) in 
+                            match eq_type a1 a2 with 
+                            | true -> TEbinop (op,a1, a2)
+                            | false -> error loc ("")
     (* TODO *) assert false
   | PEunop (Uamp, e1) ->
     (* TODO *) assert false
   | PEunop (Uneg | Unot | Ustar as op, e1) ->
     (* TODO *) assert false
   | PEcall ({id = "fmt.Print"}, el) ->
-    (* TODO *) TEprint [], tvoid, false
+    (* TODO *) (fmt_used := true; TEprint (List.map (fst expr) el), Tmany (List.map (snd expr) el), false)
+
   | PEcall ({id="new"}, [{pexpr_desc=PEident {id}}]) ->
      let ty = match id with
        | "int" -> Tint | "bool" -> Tbool | "string" -> Tstring
@@ -133,7 +142,7 @@ let sizeof = function
 (* 2. declare functions and type fields *)
 let phase2 = function
   | PDfunction { pf_name={id; loc}; pf_params=pl; pf_typ=tyl; } ->
-     (* TODO *) (if pf_name.id = "main" then found_main := true) 
+     (* TODO *) (if id = "main" then found_main := true) 
   | PDstruct { ps_name = {id}; ps_fields = fl } ->
      (* TODO *) () 
 
