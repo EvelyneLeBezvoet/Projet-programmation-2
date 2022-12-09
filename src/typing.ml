@@ -15,9 +15,37 @@ let error loc e = raise (Error (loc, e))
 
 (* TODO environnement pour les types structure *)
 
+let envStruct = Hashtbl.create 12
 
+let name_usedStruct s = match Hashtbl.find envStruct s.s_name with
+  | exception Not_found -> false
+  | l -> true
+ 
+let addStruct s loc = 
+  if name_usedStruct s 
+    then error loc ("name"^(s.s_name)^"already used for another structure")
+  else Hashtbl.add envStruct s.s_name s
 
 (* TODO environnement pour les fonctions *)
+let envFunc = Hashtbl.create 25
+
+let name_usedFunc f = match Hashtbl.find envFunc f.fn_name with
+  | exception Not_found -> false
+  | l -> true
+ 
+let addFunc f = if name_usedFunc f then "name"^(f.fn_name)^"already used for another function"
+else Hashtbl.add envFunc (f.fn_name) f
+
+let rec liste_name_var = function
+  | [] -> []
+  | t::q -> t.v_name :: (liste_name_var q)
+
+let check_var f = 
+  let noms = liste_name_var f.fn_params
+  let aux = function
+    | [] -> true
+    | t::q -> if t in q then false else aux q
+in aux noms
 
 let rec type_type = function
   | PTident { id = "int" } -> Tint
@@ -57,7 +85,7 @@ module Env = struct
   let all_vars = ref []
   let check_unused () =
     let check v =
-      if v.v_name <> "_" && (* TODO used *) v.v_used = false then error v.v_loc "unused variable" in
+      if v.v_name <> "_" && v.v_used = false then error v.v_loc "unused variable" in
     List.iter check !all_vars
 
 
@@ -84,12 +112,8 @@ let rec print_type = function
 
 let compo f g = function x -> f (g x)
 
-let rec left_value expr = (*permet de tester si une expression est une l-value ou non*)
-  match expr.expr_desc with
-  | TEident _ -> true
-  | TEdot (el, _) -> left_value el
-  | TEunop (Ustar, el) -> el.expr_desc <> TEnil
-  | _ -> false
+
+                              
 
 let rec expr env e =
   let e, ty, rt = expr_desc env e.pexpr_loc e.pexpr_desc in
@@ -102,55 +126,56 @@ and expr_desc env loc = function
   | PEconstant c ->
       TEconstant c, 
       (match c with 
-      |Cbool x -> Tbool 
-      |Cint x -> Tint
-      |Cstring x -> Tstring), 
+       |Cbool x -> Tbool 
+       |Cint x -> Tint
+       |Cstring x -> Tstring), 
       false
 
   | PEbinop (op, e1, e2) -> (match op with
       | Beq | Bne -> (let a1,rt = expr env e1 and a2,rt2 = expr env e2 in 
-            (match (eq_type a1.expr_typ a2.expr_typ) && (e1.pexpr_desc <> PEnil || e2.pexpr_desc <> PEnil) with
-            | false -> error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type a2.expr_typ))
-            | true -> TEbinop(op,a1,a2), Tbool, false))
+                      (match (eq_type a1.expr_typ a2.expr_typ) && (e1.pexpr_desc <> PEnil || e2.pexpr_desc <> PEnil) with
+                       | false -> error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type a2.expr_typ))
+                       | true -> TEbinop(op,a1,a2), Tbool, false))
   
       | Badd | Bsub | Bmul | Bdiv | Bmod -> (let a1,rt = expr env e1 and a2,rt2 = expr env e2 in
-            (match (eq_type a1.expr_typ Tint) && (eq_type a2.expr_typ Tint) with
-              | false -> if not (eq_type a1.expr_typ Tint) then (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tint)))
-                  else (error e2.pexpr_loc ("this expression has type "^(print_type a2.expr_typ)^ " but is expected to have type "^(print_type Tint)))
-              | true -> TEbinop(op,a1,a2), Tint, false))
+                                             (match (eq_type a1.expr_typ Tint) && (eq_type a2.expr_typ Tint) with
+                                              | false -> if not (eq_type a1.expr_typ Tint) then (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tint)))
+                                                  else (error e2.pexpr_loc ("this expression has type "^(print_type a2.expr_typ)^ " but is expected to have type "^(print_type Tint)))
+                                              | true -> TEbinop(op,a1,a2), Tint, false))
                               
       | Blt | Ble | Bgt | Bge -> (let a1,rt = expr env e1 and a2,rt2 = expr env e2 in
-            (match (eq_type a1.expr_typ Tint) && (eq_type a2.expr_typ Tint) with
-            | false -> if not (eq_type a1.expr_typ Tint) then (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tint)))
-                else (error e2.pexpr_loc ("this expression has type "^(print_type a2.expr_typ)^ " but is expected to have type "^(print_type Tint)))
-            | true -> TEbinop(op,a1,a2), Tbool, false))
+                                  (match (eq_type a1.expr_typ Tint) && (eq_type a2.expr_typ Tint) with
+                                   | false -> if not (eq_type a1.expr_typ Tint) then (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tint)))
+                                       else (error e2.pexpr_loc ("this expression has type "^(print_type a2.expr_typ)^ " but is expected to have type "^(print_type Tint)))
+                                   | true -> TEbinop(op,a1,a2), Tbool, false))
                               
       | Band | Bor -> (let a1,rt = expr env e1 and a2,rt2 = expr env e2 in
-            (match (eq_type a1.expr_typ Tbool) && (eq_type a2.expr_typ Tbool) with
-              | false -> if not (eq_type a1.expr_typ Tbool) then (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tbool)))
-                  else (error e2.pexpr_loc ("this expression has type "^(print_type a2.expr_typ)^ " but is expected to have type "^(print_type Tbool)))
-              | true -> TEbinop(op,a1,a2), Tbool, false)))
+                       (match (eq_type a1.expr_typ Tbool) && (eq_type a2.expr_typ Tbool) with
+                        | false -> if not (eq_type a1.expr_typ Tbool) then (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tbool)))
+                            else (error e2.pexpr_loc ("this expression has type "^(print_type a2.expr_typ)^ " but is expected to have type "^(print_type Tbool)))
+                        | true -> TEbinop(op,a1,a2), Tbool, false)))
 
 
   | PEunop (Uamp, e1) -> (let a1,rt = expr env e1 in
-      if (left_value a1) then (TEunop(Uamp, a1),Tptr a1.expr_typ,false)
-      else (error e1.pexpr_loc ("this expression is expected to be a l-value")))
+                          if (left_value a1) then (TEunop(Uamp, a1),Tptr a1.expr_typ,false)
+                          else (error e1.pexpr_loc ("this expression is expected to be a l-value")))
 
   | PEunop (Uneg | Unot | Ustar as op, e1) -> (let a1,rt = expr env e1 in
-        (match op with 
-          |Uneg -> if (eq_type a1.expr_typ Tint) then (TEunop(Uneg, a1), Tint, false) else (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tint)))
-          |Unot ->if (eq_type a1.expr_typ Tbool) then (TEunop(Unot, a1), Tbool, false) else (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tbool)))
-          |Ustar -> if (eq_type a1.expr_typ (Tptr Twild)) && (e1.pexpr_desc <> PEnil) then (TEunop(Ustar, a1), Tptr (a1.expr_typ), false) else (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type pointer"))
-        ))
+                                               (match op with 
+                                                |Uneg -> if (eq_type a1.expr_typ Tint) then (TEunop(Uneg, a1), Tint, false) else (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tint)))
+                                                |Unot ->if (eq_type a1.expr_typ Tbool) then (TEunop(Unot, a1), Tbool, false) else (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tbool)))
+                                                |Ustar -> if (eq_type a1.expr_typ (Tptr Twild)) && (e1.pexpr_desc <> PEnil) then (TEunop(Ustar, a1), Tptr (a1.expr_typ), false) else (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type pointer"))
+                                                | _ -> failwith "n'arrive jamais héhé"
+                                               ))
 
   | PEcall ({id = "fmt.Print"}, el) ->
-      let rec aux = function | [] -> []
-                            | t::q -> (t.expr_typ) :: (aux q) 
-      in
-      let l = List.map (compo fst (expr env)) el in
-      (fmt_used := true; TEprint l, Tmany (aux l), false)
+      (match el with
+       | [{pexpr_desc = PEcall (f,el2)}] -> let l,rt = expr env (List.hd el) in
+           fmt_used := true; TEprint [l], Twild, false
+       | lst -> let l = (List.map (compo fst (expr env)) lst) in 
+           fmt_used := true; TEprint l, Twild, false)
   
-  | PEcall ({id="new"}, [{pexpr_desc=PEident {id}}]) ->  (*on a une liste avec une seule expression PEident {id}*)
+  | PEcall ({id="new"}, [{pexpr_desc=PEident {id}}]) ->  (*on a une liste avec une seule expression PEident {id} qui est un type*)
       let ty = match id with
         | "int" -> Tint | "bool" -> Tbool | "string" -> Tstring
         | _ -> (* TODO *) error loc ("no such type " ^ id) in
@@ -160,27 +185,56 @@ and expr_desc env loc = function
       error loc "new expects a type"
   | PEcall (id, el) ->
       (* TODO *) assert false
-  | PEfor (e, b) ->
-      (* TODO *) assert false
-  | PEif (e1, e2, e3) ->
-      (* TODO *) assert false
+
+  | PEfor (e, b) -> (let a1,rt1 = expr env e and a2,rt2 = expr env b in
+                     if (eq_type a1.expr_typ Tbool) then TEfor (a1,a2), Twild, rt2
+                     else (error e.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tbool))))
+
+  | PEif (e1, e2, e3) -> (let a1,rt1 = expr env e1 and a2,rt2 = expr env e2 and a3,rt3 = expr env e3 in
+                          if (eq_type a1.expr_typ Tbool) then TEif (a1,a2,a3), Twild, rt2 && rt3
+                          else (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tbool))))
+      
   | PEnil ->
       TEnil, Tptr Twild, false (*nil est de type pointeur vers n'importe quel autre type*)
+
   | PEident {id=id} ->
-      (* TODO *) (try let v = Env.find id env in TEident v, v.v_typ, false
-                  with Not_found -> error loc ("unbound variable " ^ id))
+      (try let v = Env.find id env in 
+              if v.v_name <> "_" then TEident v, v.v_typ, false
+              else error v.v_loc ("the variable '_' can only be used as a lvalue")
+      with Not_found -> error loc ("unbound variable " ^ id))
+
   | PEdot (e, id) ->
       (* TODO *) assert false
   | PEassign (lvl, el) ->
       (* TODO *) TEassign ([], []), tvoid, false 
-  | PEreturn el ->
+  | PEreturn el -> (* let (al,rt = expr env el) in
+      match a1.expr_desc with
+      | TEcall (f, l1) ->
+        | *)
       (* TODO *) TEreturn [], tvoid, true
   | PEblock el ->
-      (* TODO *) TEblock [], tvoid, false
-  | PEincdec (e, op) ->
+      let aux env = function
+      | [] -> TEblock [], tvoid, false
+      | (PEvars (idlist,t,el))::q -> aux 
+      | t::q -> let a1,rt = expr env t in  
+
+  in TEblock (aux env el)
+
+  | PEincdec (e, op) -> (let a1,rt = expr env e in
+                         if (eq_type a1.expr_typ Tint) && (left_value a1) 
+                         then TEincdec(a1,op),Tint,false
+                         else (if not (left_value a1) then (error e.pexpr_loc ("this expression is expected to be a l-value"))
+                               else (error e.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tint)))))
+  | PEvars (idlist,t,el) -> 
       (* TODO *) assert false
-  | PEvars _ ->
-      (* TODO *) assert false 
+and 
+ left_value expr = (*permet de tester si une expression est une l-value ou non*)
+  match expr.expr_desc with
+  | TEident {id=id} -> (try let v = Env.find id env in true
+                        with Not_found -> false)
+  | TEdot (el, _) -> left_value el
+  | TEunop (Ustar, el) -> el.expr_desc <> TEnil
+  | _ -> false
 
 
 let found_main = ref false
@@ -196,8 +250,11 @@ let sizeof = function
 
 (* 2. declare functions and type fields *)
 let phase2 = function
-  | PDfunction { pf_name={id; loc}; pf_params=pl; pf_typ=tyl; } ->
-     (* TODO *) (if id = "main" then found_main := true) 
+  | PDfunction { pf_name={id; loc}; pf_params=pl; pf_typ=tyl; pf_body = body} ->
+   (if id = "main" 
+      then (found_main := true; 
+      if List.length pl <> 0 then error loc ("function main should not take arguments"));
+      if List.length tyl <> 0 then error loc ("function main should return nothing"))
   | PDstruct { ps_name = {id}; ps_fields = fl } ->
      (* TODO *) () 
 
