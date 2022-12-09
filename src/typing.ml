@@ -33,7 +33,7 @@ let name_usedFunc f = match Hashtbl.find envFunc f.fn_name with
   | exception Not_found -> false
   | l -> true
  
-let addFunc f = if name_usedFunc f then "name"^(f.fn_name)^"already used for another function"
+let addFunc f loc = if name_usedFunc f then error loc ("name"^(f.fn_name)^"already used for another function")
 else Hashtbl.add envFunc (f.fn_name) f
 
 let rec liste_name_var = function
@@ -41,10 +41,10 @@ let rec liste_name_var = function
   | t::q -> t.v_name :: (liste_name_var q)
 
 let check_var f = 
-  let noms = liste_name_var f.fn_params
-  let aux = function
+  let noms = liste_name_var f.fn_params in
+  let rec aux = function
     | [] -> true
-    | t::q -> if t in q then false else aux q
+    | t::q -> if List.mem t q then false else aux q
 in aux noms
 
 let rec type_type = function
@@ -54,12 +54,14 @@ let rec type_type = function
   | PTptr ty -> Tptr (type_type ty)
   | _ -> error dummy_loc ("unknown struct ") (* TODO type structure *)
 
-let rec eq_type ty1 ty2 = match ty1, ty2 with                  (*sert à vérifier que deux types sont bien égaux*)
-  | Tint, Tint | Tbool, Tbool | Tstring, Tstring | Twild, _ | _, Twild-> true
+  let rec eq_type ty1 ty2 = match ty1, ty2 with                  (*sert à vérifier que deux types sont bien égaux*)
+  | Tint, Tint | Tbool, Tbool | Tstring, Tstring -> true
   | Tstruct s1, Tstruct s2 -> s1 == s2
   | Tptr ty1, Tptr ty2 -> eq_type ty1 ty2
   | Tmany [], Tmany [] -> true
   | Tmany (t1::q1), Tmany (t2::q2) -> (t1 == t2) && eq_type (Tmany q1) (Tmany q2) 
+  | Twild, _ -> true
+  | _ , Twild -> true
   | _ -> false
 
     (* TODO autres types *)
@@ -73,7 +75,7 @@ let new_var =
   let id = ref 0 in    (*sert à numéroter les variables d'un bloc*)
   fun x loc ?(used=false) ty -> (*à l'initialisation de la variable, elle n'a pas encore été utilisée => used = false*)
     incr id;
-    { v_name = x; v_id = !id; v_loc = loc; v_typ = ty; v_used = used; v_addr = 0; v_depth = 0 }
+    { v_name = x; v_id = !id; v_loc = loc; v_typ = ty; v_used = false; v_addr = 0; v_depth = 0 }
 
 module Env = struct
   module M = Map.Make(String)
@@ -112,7 +114,7 @@ let rec print_type = function
 
 let compo f g = function x -> f (g x)
 
-
+let firstList l = (List.hd l).loc
                               
 
 let rec expr env e =
@@ -171,7 +173,7 @@ and expr_desc env loc = function
   | PEcall ({id = "fmt.Print"}, el) ->
       (match el with
        | [{pexpr_desc = PEcall (f,el2)}] -> let l,rt = expr env (List.hd el) in
-           fmt_used := true; TEprint [l], Twild, false
+           fmt_used := true; print_string "blup"; TEprint [l], Twild, false
        | lst -> let l = (List.map (compo fst (expr env)) lst) in 
            fmt_used := true; TEprint l, Twild, false)
   
@@ -213,29 +215,47 @@ and expr_desc env loc = function
         | *)
       (* TODO *) TEreturn [], tvoid, true
   | PEblock el ->
-      let aux env = function
+      TEblock (List.map (compo fst (expr env)) el), tvoid, false
+    (*  let aux env = function
       | [] -> TEblock [], tvoid, false
-      | (PEvars (idlist,t,el))::q -> aux 
+      | (PEvars (idlist, Some ty, []))::q -> 
+        if not (eq_type (type_type ty) Twild )
+          then (error (firstList idlist) ("type"^ty^"is undefined"))
+          else (let env2 = Env.add env x=5)
+
+
+      | (PEvars (idlist, Some ty, pexpr_list))::q
+
+      | (PEvars (idlist, None, pexpr_list))::q
+
+      | (PEvars (idlist, Some ty, [{pexpr_desc = PEcall (f,el2)}]))::q
+
+      | (PEvars (idlist, None, [{pexpr_desc = PEcall (f,el2)}]))::q
+
       | t::q -> let a1,rt = expr env t in  
 
-  in TEblock (aux env el)
+  in TEblock (aux env el)*)
 
   | PEincdec (e, op) -> (let a1,rt = expr env e in
                          if (eq_type a1.expr_typ Tint) && (left_value a1) 
                          then TEincdec(a1,op),Tint,false
                          else (if not (left_value a1) then (error e.pexpr_loc ("this expression is expected to be a l-value"))
                                else (error e.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tint)))))
-  | PEvars (idlist,t,el) -> 
+  
+  (*| PEvars (idlist, Some ty, pexpr_list) -> if (eq_type (type_type ty) Twild) then TEvars()
+  | PEvars (idlist, None, []) -> 
+  | PEvars (idlist, None, pexpr_list)
+  | PEvars (idlist, Some ty, [{pexpr_desc = PEcall (f,el2)}])
+  | PEvars (idlist, None, [{pexpr_desc = PEcall (f,el2)}])*)
+  | PEvars _ ->
       (* TODO *) assert false
 and 
- left_value expr = (*permet de tester si une expression est une l-value ou non*)
-  match expr.expr_desc with
-  | TEident {id=id} -> (try let v = Env.find id env in true
-                        with Not_found -> false)
-  | TEdot (el, _) -> left_value el
-  | TEunop (Ustar, el) -> el.expr_desc <> TEnil
-  | _ -> false
-
+left_value expr = (*permet de tester si une expression est une l-value ou non*)
+match expr.expr_desc with
+| TEident _ -> true
+| TEdot (el, _) -> left_value el
+| TEunop (Ustar, el) -> el.expr_desc <> TEnil
+| _ -> false 
 
 let found_main = ref false
 
@@ -253,8 +273,8 @@ let phase2 = function
   | PDfunction { pf_name={id; loc}; pf_params=pl; pf_typ=tyl; pf_body = body} ->
    (if id = "main" 
       then (found_main := true; 
-      if List.length pl <> 0 then error loc ("function main should not take arguments"));
-      if List.length tyl <> 0 then error loc ("function main should return nothing"))
+      if List.length pl <> 0 then error loc ("function main should not take arguments");
+      if List.length tyl <> 0 then error loc ("function main should return nothing")))
   | PDstruct { ps_name = {id}; ps_fields = fl } ->
      (* TODO *) () 
 
@@ -277,5 +297,6 @@ let file ~debug:b (imp, dl) =
   if not !found_main then error dummy_loc "missing method main";
   let dl = List.map decl dl in
   Env.check_unused (); (* TODO variables non utilisees *)
-  if imp && not !fmt_used then error dummy_loc "fmt imported but not used";
+  if (imp && not !fmt_used) then error dummy_loc "fmt imported but not used";
+  if (not imp && !fmt_used) then error dummy_loc "fmt not imported but used";
   dl
