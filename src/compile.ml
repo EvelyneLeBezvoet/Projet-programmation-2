@@ -69,7 +69,6 @@ let compile_bool f =
   movq (imm 0) (reg rdi) ++ jmp l_end ++
   label l_true ++ movq (imm 1) (reg rdi) ++ label l_end
 
-let typ_affichage = ref Twild
 let rec expr env e = 
   let typer = e.expr_typ in
   match e.expr_desc with
@@ -158,19 +157,10 @@ let rec expr env e =
   | TEprint el -> 
     (match el with 
       | [] -> nop
-      | t::q -> expr env t ++ ( let a = !typ_affichage in 
-                                match t.expr_typ with
-                                | Tint ->( typ_affichage := Tint;
-                                          (if (a <> Tint) 
-                                            then (call "print_int")
-                                          else (movq (reg rdi) (reg rbp)
-                                          ++ movq (ilab (alloc_string " ")) (reg rdi) ++ call "printf"
-                                          ++ movq (reg rbp) (reg rdi) ++ call "print_int");
-                                          nop ))
-                                            (*on rajoute un espace entre deux entiers*)
+      | t::q -> expr env t ++ ( match t.expr_typ with
+                                | Tint ->call "print_int"
 
-                                | Tstring -> (typ_affichage := Twild; 
-                                             label "Twild" ++ call "printf")
+                                | Tstring -> (call "printf")
 
                                 | Tbool -> if t.expr_desc = TEconstant(Cbool false) then (expr env {expr_desc = TEprint [{expr_desc = TEconstant (Cstring "false"); expr_typ = Tstring}]; expr_typ = Twild})
                                           else (expr env {expr_desc = TEprint [{expr_desc = TEconstant (Cstring "true"); expr_typ = Tstring}]; expr_typ = Twild})
@@ -190,13 +180,18 @@ let rec expr env e =
       | t::q -> expr env t ++ expr env {expr_desc = (TEblock q); expr_typ = typer})
      
   | TEif (e1, e2, e3) ->
+    (*expr env e1 
+    ++ pushq (reg rdi)
+    ++ cmpq (reg rdi) (imm64 0)
+    ++*)
      (* TODO code pour if *) assert false
   | TEfor (e1, e2) ->
      (* TODO code pour for *) assert false
   | TEnew ty ->
      (* TODO code pour new S *) assert false
   | TEcall (f, el) ->
-     (* TODO code pour appel fonction *) assert false
+    jmp ("F_"^f.fn_name)
+     (* TODO code pour appel fonction *)
   | TEdot (e1, {f_ofs=ofs}) ->
      (* TODO code pour e.f *) assert false
   | TEvars _ ->
@@ -209,8 +204,6 @@ let rec expr env e =
      assert false
   | TEincdec (e1, op) ->
     (* TODO code pour return e++, e-- *) assert false
-
-let typ_affichage = ref Twild
 
 let function_ f e env =
   if !debug then eprintf "function %s:@." f.fn_name;
