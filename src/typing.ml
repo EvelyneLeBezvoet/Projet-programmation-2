@@ -1,302 +1,508 @@
 
 open Format
+open Usage
 open Lib
 open Ast
 open Tast
 
 let debug = ref false
+let found_main = ref false
+let fmt_used = ref false
+let fmt_imported = ref true
 
 let dummy_loc = Lexing.dummy_pos, Lexing.dummy_pos
-
 exception Error of Ast.location * string
 exception Anomaly of string
 
-let error loc e = raise (Error (loc, e))
 
-(* TODO environnement pour les types structure *)
+let tvoid = Tmany []
 
-let envStruct = Hashtbl.create 12
+let rec printable_type = function
+  | Tint -> "int"
+  | Tbool -> "bool"
+  | Tstring -> "string"
+  | Tstruct structure -> structure.s_name
+  | Tptrnil -> "<nil>"
+  | Twild -> "<wild>" (* for internal purpose only *)
+  | Tptr typ -> "*" ^ (printable_type typ)
+  | Tmany [] -> "instruction"
+  | Tmany [t] -> printable_type t ^ " (·)"
+  | Tmany (t :: q) -> (printable_type t) ^ " · " ^ (printable_type (Tmany q))
 
-let name_usedStruct s = match Hashtbl.find envStruct s.s_name with
-  | exception Not_found -> false
-  | l -> true
- 
-let addStruct s loc = 
-  if name_usedStruct s 
-    then error loc ("name"^(s.s_name)^"already used for another structure")
-  else Hashtbl.add envStruct s.s_name s
+let type_error_message expected received =
+  "This expression has type '" ^ (printable_type received)
+  ^ "' but an expression of type '" ^ (printable_type expected) ^ "' was expected"
 
-(* TODO environnement pour les fonctions *)
-let envFunc = Hashtbl.create 25
+let incorrect_wild_use = "cannot use _ as value"
 
-let name_usedFunc f = match Hashtbl.find envFunc f.fn_name with
-  | exception Not_found -> false
-  | l -> true
- 
-let addFunc f loc = if name_usedFunc f then error loc ("name"^(f.fn_name)^"already used for another function")
-else Hashtbl.add envFunc (f.fn_name) f
+(* context types *)
+type struct_env = structure M.t
+type fun_env = function_ M.t
 
-let rec liste_name_var = function
-  | [] -> []
-  | t::q -> t.v_name :: (liste_name_var q)
-
-let check_var f = 
-  let noms = liste_name_var f.fn_params in
-  let rec aux = function
-    | [] -> true
-    | t::q -> if List.mem t q then false else aux q
-in aux noms
-
-let rec type_type = function
-  | PTident { id = "int" } -> Tint
-  | PTident { id = "bool" } -> Tbool
-  | PTident { id = "string" } -> Tstring
-  | PTptr ty -> Tptr (type_type ty)
-  | _ -> error dummy_loc ("unknown struct ") (* TODO type structure *)
-
-  let rec eq_type ty1 ty2 = match ty1, ty2 with                  (*sert à vérifier que deux types sont bien égaux*)
-  | Tint, Tint | Tbool, Tbool | Tstring, Tstring -> true
-  | Tstruct s1, Tstruct s2 -> s1 == s2
-  | Tptr ty1, Tptr ty2 -> eq_type ty1 ty2
-  | Tmany [], Tmany [] -> true
-  | Tmany (t1::q1), Tmany (t2::q2) -> (t1 == t2) && eq_type (Tmany q1) (Tmany q2) 
-  | Twild, _ -> true
-  | _ , Twild -> true
-  | _ -> false
-
-    (* TODO autres types *)
-
-let fmt_used = ref false
-let fmt_imported = ref false
-
+(* expression associated with a variable *)
 let evar v = { expr_desc = TEident v; expr_typ = v.v_typ }
 
+let wildvar = {
+  v_name = "_"; v_id = -1;
+  v_loc = dummy_loc; v_typ = Twild;
+  v_depth = 0; v_used = true; v_addr = 0 
+}
+
+
 let new_var =
-  let id = ref 0 in    (*sert à numéroter les variables d'un bloc*)
-  fun x loc ?(used=false) ty -> (*à l'initialisation de la variable, elle n'a pas encore été utilisée => used = false*)
+  let id = ref 0 in
+  fun x loc ?(depth=0) ?(used=false) ty ->
     incr id;
-    { v_name = x; v_id = !id; v_loc = loc; v_typ = ty; v_used = false; v_addr = 0; v_depth = 0 }
+    { v_name = x; v_id = !id; v_loc = loc; v_typ = ty;
+      v_depth = depth; v_used = used; v_addr = 0 }
 
 module Env = struct
-  module M = Map.Make(String)
-  type t = var M.t
-  let empty = M.empty
-  let find = M.find
-  let add env v = M.add v.v_name v env
+  type e = {
+    vars: var M.t;
+    functions: fun_env;
+    structures: struct_env;
+    return_values: typ list;
+    returns: bool;
+    depth: int;
+  }
+
+  let push_down env = {env with depth = env.depth + 1}
+  let find_opt id env = M.find_opt id env.vars
+  let add env v = {env with vars=(M.add v.v_name v env.vars)}
+  let add_vars = List.fold_left add
+
+  let new_env functions structures f = add_vars {
+    vars=M.empty;
+    functions; structures;
+    return_values=f.fn_typ;
+    returns=false;
+    depth=0
+  } f.fn_params
 
   let all_vars = ref []
   let check_unused () =
-    let check v =
-      if v.v_name <> "_" && v.v_used = false then error v.v_loc "unused variable" in
-    List.iter check !all_vars
+    List.iter (fun v -> if v.v_name <> "_" && not v.v_used
+      then raise (Error (v.v_loc, "unused variable '" ^ v.v_name ^ "'")))
+    !all_vars
 
+  let var x loc ty ?(used=false) env = match x, ty with
+      | _, Tmany _ | _, Tptrnil -> raise (Error (loc,
+          "variable '" ^ x ^ "' may not have type '" ^ printable_type ty ^ "'"))
 
-  let var x loc ?used ty env =
-    let v = new_var x loc ?used ty in
-    all_vars := v :: !all_vars;
-    add env v, v
+      | "_", _ -> env, wildvar
 
-  (* TODO type () et vecteur de types *)
+      | _, _ -> let v = new_var x loc ty ~used ~depth:env.depth in
+          all_vars := v :: !all_vars;
+          begin match find_opt x env with
+            | None -> add env v, v
+            | Some v' -> if env.depth > v'.v_depth
+                then add env v, v
+                else raise (Error (loc, "variable '" ^ x ^ "' already defined"))
+          end
 end
 
-let tvoid = Tmany []
-let make d ty = { expr_desc = d; expr_typ = ty }  (*correspond à {expression x de TAST; type de x}*)
-let stmt d = make d tvoid (*correspond à {expression x de TAST; tvoid = absence de type pour l'instant}*)
 
-let rec print_type = function
-  | Tint -> "int"
-  | Tbool -> "bool" 
-  | Tstring -> "string"
-  | Tstruct s -> "struct" 
-  | Tptr a -> "ptr"^(print_type a)
-  | Twild -> "wild"
-  | Tmany l -> "typ list"
+(* associate precise type if valid in a given structure context *)
+(* replacement for the original 'type_type' function *)
+let rec find_type structures = function
+  | PTptr ptyp -> Tptr (find_type structures ptyp)
+  | PTident {id = "int"; loc} -> Tint
+  | PTident {id = "bool"; loc} -> Tbool
+  | PTident {id = "string"; loc} -> Tstring
+  | PTident {id; loc} -> if M.mem id structures
+      then Tstruct (M.find id structures)
+      else raise (Error (loc, "unknown type '" ^ id ^ "'"))
 
-let compo f g = function x -> f (g x)
+(* Tests equality between types. *)
+(* instruction types (Tmany []) shall never be tested *)
+let rec eq_type ty1 ty2 =
+  match ty1, ty2 with
+  | Tint, Tint | Tbool, Tbool | Tstring, Tstring -> true
+  | Tptrnil, Tptr _ | Tptr _, Tptrnil -> true
+  | Twild, _ | _, Twild -> true
+  | Tstruct s1, Tstruct s2 -> s1 == s2
+  | Tptr ty1, Tptr ty2 -> eq_type ty1 ty2
+  | _ -> false
 
-let firstList l = (List.hd l).loc
-                              
+let rec correspondance param loc typ1 typ2 = match typ1, typ2 with
+  | [], [] -> ()
+  | _, [] -> raise (Error (loc, "not enough " ^ param))
+  | [], _ -> raise (Error (loc, "too many " ^ param))
+  | (lt :: lq), (et :: eq) -> if eq_type lt et
+      then correspondance param loc lq eq
+      else raise (Error (loc, type_error_message lt et))
 
-let rec expr env e =
-  let e, ty, rt = expr_desc env e.pexpr_loc e.pexpr_desc in
-  { expr_desc = e; expr_typ = ty }, rt
-  
+let call_correspondance = correspondance "parameters"
+let assignation_correspondance = correspondance "values to unpack"
+let return_correspondance = correspondance "returned values"
+
+let rec lvalue_test {expr_desc} = match expr_desc with
+  | TEdot (e, x) -> lvalue_test e
+  | TEident _ -> true
+  | TEunop (Ustar, _) -> true
+  | _ -> false
+
+
+let make d ty = { expr_desc = d; expr_typ = ty }
+let stmt d = {expr_desc=d; expr_typ=tvoid} (* statement *)
+
+
+(* types an expression and returns a possibly modified environment *)
+let rec expr (env: Env.e) e =
+  let e, ty, env' = expr_desc env e.pexpr_loc e.pexpr_desc in
+  { expr_desc = e; expr_typ = ty }, env'
+
 and expr_desc env loc = function
-  | PEskip ->
-      TEskip, tvoid, false
+  | PEskip -> TEskip, tvoid, env
 
-  | PEconstant c ->
-      TEconstant c, 
-      (match c with 
-       |Cbool x -> Tbool 
-       |Cint x -> Tint
-       |Cstring x -> Tstring), 
-      false
+  | PEconstant c -> begin match c with
+      | Cint _ -> TEconstant c, Tint, env
+      | Cstring _ -> TEconstant c, Tstring, env
+      | Cbool _ -> TEconstant c, Tbool, env
+    end
 
-  | PEbinop (op, e1, e2) -> (match op with
-      | Beq | Bne -> (let a1,rt = expr env e1 and a2,rt2 = expr env e2 in 
-                      (match (eq_type a1.expr_typ a2.expr_typ) && (e1.pexpr_desc <> PEnil || e2.pexpr_desc <> PEnil) with
-                       | false -> error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type a2.expr_typ))
-                       | true -> TEbinop(op,a1,a2), Tbool, false))
-  
-      | Badd | Bsub | Bmul | Bdiv | Bmod -> (let a1,rt = expr env e1 and a2,rt2 = expr env e2 in
-                                             (match (eq_type a1.expr_typ Tint) && (eq_type a2.expr_typ Tint) with
-                                              | false -> if not (eq_type a1.expr_typ Tint) then (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tint)))
-                                                  else (error e2.pexpr_loc ("this expression has type "^(print_type a2.expr_typ)^ " but is expected to have type "^(print_type Tint)))
-                                              | true -> TEbinop(op,a1,a2), Tint, false))
-                              
-      | Blt | Ble | Bgt | Bge -> (let a1,rt = expr env e1 and a2,rt2 = expr env e2 in
-                                  (match (eq_type a1.expr_typ Tint) && (eq_type a2.expr_typ Tint) with
-                                   | false -> if not (eq_type a1.expr_typ Tint) then (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tint)))
-                                       else (error e2.pexpr_loc ("this expression has type "^(print_type a2.expr_typ)^ " but is expected to have type "^(print_type Tint)))
-                                   | true -> TEbinop(op,a1,a2), Tbool, false))
-                              
-      | Band | Bor -> (let a1,rt = expr env e1 and a2,rt2 = expr env e2 in
-                       (match (eq_type a1.expr_typ Tbool) && (eq_type a2.expr_typ Tbool) with
-                        | false -> if not (eq_type a1.expr_typ Tbool) then (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tbool)))
-                            else (error e2.pexpr_loc ("this expression has type "^(print_type a2.expr_typ)^ " but is expected to have type "^(print_type Tbool)))
-                        | true -> TEbinop(op,a1,a2), Tbool, false)))
-
-
-  | PEunop (Uamp, e1) -> (let a1,rt = expr env e1 in
-                          if (left_value a1) then (TEunop(Uamp, a1),Tptr a1.expr_typ,false)
-                          else (error e1.pexpr_loc ("this expression is expected to be a l-value")))
-
-  | PEunop (Uneg | Unot | Ustar as op, e1) -> (let a1,rt = expr env e1 in
-                                               (match op with 
-                                                |Uneg -> if (eq_type a1.expr_typ Tint) then (TEunop(Uneg, a1), Tint, false) else (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tint)))
-                                                |Unot ->if (eq_type a1.expr_typ Tbool) then (TEunop(Unot, a1), Tbool, false) else (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tbool)))
-                                                |Ustar -> if (eq_type a1.expr_typ (Tptr Twild)) && (e1.pexpr_desc <> PEnil) then (TEunop(Ustar, a1), Tptr (a1.expr_typ), false) else (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type pointer"))
-                                                | _ -> failwith "n'arrive jamais héhé"
-                                               ))
-
-  | PEcall ({id = "fmt.Print"}, el) ->
-      (match el with
-       | [{pexpr_desc = PEcall (f,el2)}] -> let l,rt = expr env (List.hd el) in
-           fmt_used := true; print_string "blup"; TEprint [l], Twild, false
-       | lst -> let l = (List.map (compo fst (expr env)) lst) in 
-           fmt_used := true; TEprint l, Twild, false)
-  
-  | PEcall ({id="new"}, [{pexpr_desc=PEident {id}}]) ->  (*on a une liste avec une seule expression PEident {id} qui est un type*)
-      let ty = match id with
-        | "int" -> Tint | "bool" -> Tbool | "string" -> Tstring
-        | _ -> (* TODO *) error loc ("no such type " ^ id) in
-      TEnew ty, Tptr ty, false
-
-  | PEcall ({id="new"}, _) ->
-      error loc "new expects a type"
-  | PEcall (id, el) ->
-      (* TODO *) assert false
-
-  | PEfor (e, b) -> (let a1,rt1 = expr env e and a2,rt2 = expr env b in
-                     if (eq_type a1.expr_typ Tbool) then TEfor (a1,a2), Twild, rt2
-                     else (error e.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tbool))))
-
-  | PEif (e1, e2, e3) -> (let a1,rt1 = expr env e1 and a2,rt2 = expr env e2 and a3,rt3 = expr env e3 in
-                          if (eq_type a1.expr_typ Tbool) then TEif (a1,a2,a3), Twild, rt2 && rt3
-                          else (error e1.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tbool))))
+  | PEbinop (op, e1, e2) ->
+      let e1', _ = expr env e1 and e2', _ = expr env e2 in
+      let {expr_typ=t1} = e1' and {expr_typ=t2} = e2' in
+      begin match op with
+        | Badd | Bsub | Bmul | Bdiv | Bmod ->
+            begin match t1, t2 with
+              | Tint, Tint -> TEbinop (op, e1', e2'), Tint, env
+              | Tint, _ -> raise (Error (e2.pexpr_loc, type_error_message Tint t2))
+              | _, _ -> raise (Error (e1.pexpr_loc, type_error_message Tint t1))
+            end
+        | Beq | Bne -> if eq_type t1 t2
+            then TEbinop (op, e1', e2'), Tbool, env
+            else raise (Error (loc, "expressions do not have the same type"))
+        | Blt | Ble | Bgt | Bge ->
+            begin match t1, t2 with
+              | Tint, Tint -> TEbinop (op, e1', e2'), Tbool, env
+              | Tint, _ -> raise (Error (e2.pexpr_loc, type_error_message Tint t2))
+              | _, _ -> raise (Error (e1.pexpr_loc, type_error_message Tint t1))
+            end
+        | Band | Bor ->
+            begin match t1, t2 with
+              | Tbool, Tbool -> TEbinop (op, e1', e2'), Tbool, env
+              | Tbool, _ -> raise (Error (e2.pexpr_loc, type_error_message Tbool t2))
+              | _, _ -> raise (Error (e1.pexpr_loc, type_error_message Tbool t1))
+            end
+      end
+    
+  | PEunop (Uamp, e1) ->
+      let e1', _ = expr env e1 in if lvalue_test e1'
+        then TEunop (Uamp, e1'), Tptr e1'.expr_typ, env
+        else raise (Error (e1.pexpr_loc, "lvalue required as operand of '&'"))
       
-  | PEnil ->
-      TEnil, Tptr Twild, false (*nil est de type pointeur vers n'importe quel autre type*)
+  | PEunop (Uneg | Unot | Ustar as op, e1) ->
+      let e1', _ = expr env e1 in begin match op, e1'.expr_typ with
+        | Uneg, Tint -> TEunop (Uneg, e1'), Tint, env
+        | Uneg, t -> raise (Error (e1.pexpr_loc, type_error_message Tint t))
+        | Unot, Tbool -> TEunop (Unot, e1'), Tbool, env
+        | Unot, t -> raise (Error (e1.pexpr_loc, type_error_message Tbool t))
+        | Ustar, Tptrnil -> raise (Error (e1.pexpr_loc, "cannot dereference nil"))
+        | Ustar, Tptr t -> TEunop (Ustar, e1'), t, env
+        | _ -> raise (Error (e1.pexpr_loc, "cannot dereference this"))
+      end  
 
-  | PEident {id=id} ->
-      (try let v = Env.find id env in 
-              if v.v_name <> "_" then TEident v, v.v_typ, false
-              else error v.v_loc ("the variable '_' can only be used as a lvalue")
-      with Not_found -> error loc ("unbound variable " ^ id))
+  | PEcall ({id = "fmt.Print"; loc}, el) ->
+      if not !fmt_imported then raise (Error (loc, "unknown function 'fmt.Print'"));
+      let el', typ_list = expr_list env el in
+      List.iter (function
+        | Tmany _ -> raise (Error (loc, "this is not a correct expression, it cannot be printed"))
+        | _ -> ()) typ_list;
+      fmt_used := true;
+      TEprint el', tvoid, env
 
-  | PEdot (e, id) ->
-      (* TODO *) assert false
+  | PEcall ({id="new"}, [{pexpr_desc=PEident ident}]) ->
+      let t = find_type env.structures (PTident ident) in TEnew t, Tptr t, env
+  | PEcall ({id="new"}, _) -> raise (Error (loc, "new expects a type"))
+
+  | PEcall ({id; loc}, el) -> begin match M.find_opt id env.functions with
+      | Some callee -> 
+          let el', typ_list = expr_list env el in
+          call_correspondance loc typ_list
+            (List.map (fun v -> v.v_typ) callee.fn_params);
+          let ret_typ = match callee.fn_typ with
+            | [t] -> t
+            | l -> Tmany l
+          in
+          TEcall (callee, el'), ret_typ, env
+      | None -> raise (Error (loc, "unknown function '" ^ id ^ "'"))     
+    end
+
+  | PEfor (b, e) ->
+      let e', _ = expr env e and b', _ = expr env b in
+      begin match e'.expr_typ, b'.expr_typ with
+        | Tmany [], Tbool -> TEfor (b', e'), tvoid, env
+        | _, Tbool -> raise (Error (loc, "syntax error"))
+        | _, t -> raise (Error (b.pexpr_loc, type_error_message Tbool t))
+      end
+
+  | PEif (b, e1, e2) ->
+      let e1', env1 = expr env e1
+      and e2', env2 = expr env e2
+      and b', _ = expr env b in
+      begin match b'.expr_typ, e1'.expr_typ, e2'.expr_typ with
+        | Tbool, Tmany [], Tmany [] -> TEif (b', e1', e2'), tvoid,
+            {env with returns = env.returns || (env1.returns && env2.returns)}
+        | Tbool, _, _ -> raise (Error (loc, "syntax error"))
+        | _, _, _ -> raise (Error (b.pexpr_loc, type_error_message Tbool b'.expr_typ))
+      end
+
+  | PEnil -> TEnil, Tptrnil, env
+      
+  | PEident {id} -> begin match Env.find_opt id env, id with
+      | _, "_" -> raise (Error (loc, incorrect_wild_use))
+      | Some v, _ -> v.v_used <- true; TEident v, v.v_typ, env
+      | None, _ -> raise (Error (loc, "unknown variable '" ^ id ^ "'"))
+    end
+
+  | PEdot (e, {id; loc=id_loc}) ->
+      let e', _ = expr env e in begin match e'.expr_typ with
+        | Tptr (Tstruct structure) | Tstruct structure ->
+            begin match Hashtbl.find_opt structure.s_fields id with
+              | Some field -> TEdot (e', field), field.f_typ, env
+              | None -> raise (Error (id_loc, "structure '" ^ structure.s_name
+                  ^ "' has no field named '" ^ id ^ "'"))
+            end
+        | _ -> raise (Error (e.pexpr_loc,
+            "this is not a valid structure nor a pointer to a structure"))
+      end
+
   | PEassign (lvl, el) ->
-      (* TODO *) TEassign ([], []), tvoid, false 
-  | PEreturn el -> (* let (al,rt = expr env el) in
-      match a1.expr_desc with
-      | TEcall (f, l1) ->
-        | *)
-      (* TODO *) TEreturn [], tvoid, true
+      let lvl', lvl_typ = expr_list ~wildcard:true env lvl
+      and el', el_typ = expr_list env el in
+      List.iter (fun e -> if not (lvalue_test e)
+        then raise (Error (loc, "this is not an lvalue, it cannot be assigned a value"))) lvl';
+      assignation_correspondance loc lvl_typ el_typ;
+      TEassign (lvl', el'), tvoid, env
+
+  | PEreturn el ->
+      let el', el_typ = expr_list env el in
+      return_correspondance loc env.return_values el_typ;
+      TEreturn el', tvoid, {env with returns = true}
+
   | PEblock el ->
-      TEblock (List.map (compo fst (expr env)) el), tvoid, false
-    (*  let aux env = function
-      | [] -> TEblock [], tvoid, false
-      | (PEvars (idlist, Some ty, []))::q -> 
-        if not (eq_type (type_type ty) Twild )
-          then (error (firstList idlist) ("type"^ty^"is undefined"))
-          else (let env2 = Env.add env x=5)
+      let has_already_returned = ref false in
+      let rec iter_block env = function
+        | e :: t -> let e', env' = expr env e in begin match e'.expr_typ with
+            | Tmany [] -> let el', env_f = iter_block env' t in
+                if env.returns && not !has_already_returned
+                  then (Error (e.pexpr_loc, "Warning : instructions after return instruction"); has_already_returned := true);
+                e' :: el', env_f
+            | _ -> raise (Error (loc, "this is not an instruction"))
+          end
+        | [] -> [], env
+      in
+      let el', env_f = iter_block (Env.push_down env) el in
+      TEblock el', tvoid, {env with returns = env_f.returns}
 
+  | PEincdec (e, op) ->
+      let ops = if op = Inc then "increment" else "decrement" in
+      let e', _ = expr env e in begin match e'.expr_typ with
+        | Tint -> if lvalue_test e'
+            then TEincdec (e', op), tvoid, env
+            else raise (Error (loc, "lvalue required as " ^ ops ^ " operand")) 
+        | t -> raise (Error (loc, type_error_message Tint t))
+      end
 
-      | (PEvars (idlist, Some ty, pexpr_list))::q
+  | PEvars (ids, ptypo, el) ->
+      let el', typ_list = expr_list env el in
+      let env', varlist, assignlist = match ptypo, el' with
+        | Some ptyp, [] ->
+            let typ = find_type env.structures ptyp in
+            let nilexpr = {expr_desc = TEnil; expr_typ = Tptrnil} in
+            (* NOTE: This works because structures and structure pointers are treated almost equally. *)
+            let newexpr = {expr_desc = TEnew typ; expr_typ = Tptrnil} in
+            let rec instanciate env varlist assignlist = function 
+              | [] -> env, varlist, assignlist
+              | id :: iq ->
+                  let env', v = Env.var id.id id.loc typ env in
+                  instanciate env' (v :: varlist)
+                    ((match typ with Tstruct _ -> newexpr | _ -> nilexpr) :: assignlist) iq
+            in
+            instanciate env [] [] ids
+            
+        | None, _ ->
+            let rec instanciate env varlist ids l = match ids, l with
+              (* accumulated list is reversed in order to match that of initialisation values *)
+              | [], [] -> env, List.rev varlist, el'
+              | _, [] -> raise (Error (loc, "not enough values to unpack"))
+              | [], _ -> raise (Error (loc, "too many values to unpack"))
+              | (id :: iq), (t :: q) ->
+                  let env', v = Env.var id.id id.loc t env in
+                    instanciate env' (v :: varlist) iq q
+            in
+            instanciate env [] ids typ_list
 
-      | (PEvars (idlist, None, pexpr_list))::q
+        | Some ptyp, _ ->
+            let typ = find_type env.structures ptyp in
+            let rec instanciate env varlist ids l = match ids, l with
+              | [], [] -> env, List.rev varlist, el'
+              | _, [] -> raise (Error (loc, "not enough values to unpack"))
+              | [], _ -> raise (Error (loc, "too many values to unpack"))
+              | (id :: iq), (t :: q) -> if eq_type t typ
+                  then begin
+                    let env', v = Env.var id.id id.loc typ env in
+                    instanciate env' (v :: varlist) iq q
+                  end
+                  else raise (Error (loc, type_error_message typ t))
+            in
+            instanciate env [] ids typ_list
+      in
+      TEvars (varlist, assignlist), tvoid, env'
 
-      | (PEvars (idlist, Some ty, [{pexpr_desc = PEcall (f,el2)}]))::q
-
-      | (PEvars (idlist, None, [{pexpr_desc = PEcall (f,el2)}]))::q
-
-      | t::q -> let a1,rt = expr env t in  
-
-  in TEblock (aux env el)*)
-
-  | PEincdec (e, op) -> (let a1,rt = expr env e in
-                         if (eq_type a1.expr_typ Tint) && (left_value a1) 
-                         then TEincdec(a1,op),Tint,false
-                         else (if not (left_value a1) then (error e.pexpr_loc ("this expression is expected to be a l-value"))
-                               else (error e.pexpr_loc ("this expression has type "^(print_type a1.expr_typ)^ " but is expected to have type "^(print_type Tint)))))
-  
-  (*| PEvars (idlist, Some ty, pexpr_list) -> if (eq_type (type_type ty) Twild) then TEvars()
-  | PEvars (idlist, None, []) -> 
-  | PEvars (idlist, None, pexpr_list)
-  | PEvars (idlist, Some ty, [{pexpr_desc = PEcall (f,el2)}])
-  | PEvars (idlist, None, [{pexpr_desc = PEcall (f,el2)}])*)
-  | PEvars _ ->
-      (* TODO *) assert false
-and 
-left_value expr = (*permet de tester si une expression est une l-value ou non*)
-match expr.expr_desc with
-| TEident _ -> true
-| TEdot (el, _) -> left_value el
-| TEunop (Ustar, el) -> el.expr_desc <> TEnil
-| _ -> false 
-
-let found_main = ref false
+(* evaluates a list of expression (including function calls with multiple return values) *)
+(* the wildcard flag allows the use of _ (in the left part of an assignation for instance) *)
+and expr_list ?(wildcard=false) env = function
+  | [({pexpr_desc=PEcall _} as call)] ->
+      let e, _ = expr env call in
+      begin match e.expr_typ with
+        | Tmany l -> [e], l
+        | t -> [e], [t]
+      end
+  | l -> let l' = List.map (function
+      | {pexpr_desc = PEident {id = "_"}} when wildcard -> evar wildvar, Twild
+      | {pexpr_desc = PEident {id = "_"; loc}} -> raise (Error (loc, incorrect_wild_use))
+      | e -> let e', _ = expr env e in e', e'.expr_typ) l in
+      List.split l'
 
 (* 1. declare structures *)
-let phase1 = function
-  | PDstruct { ps_name = { id = id; loc = loc }} -> (* TODO *) ()
-  | PDfunction _ -> ()
+(* builds a *typed* structure environment, with at first no field *)
+let phase1 structures = function
+  | PDstruct {ps_name = {id = ("int" | "bool" | "string") as id; loc}; _} ->
+      raise (Error (loc, "redefinition of type primitive '" ^ id ^ "'"))
+  | PDstruct {ps_name = {id; loc}; _} ->
+      if M.mem id structures
+        then raise (Error (loc, "structure '" ^ id ^ "' already defined"))
+        else M.add id {s_name=id; s_ordered_fields = [];
+          s_fields=(Hashtbl.create 5); s_size=0} structures
+  | PDfunction _ -> structures
 
 let sizeof = function
   | Tint | Tbool | Tstring | Tptr _ -> 8
-  | _ -> (* TODO *) assert false 
+  | Tstruct s -> s.s_size
+  | t -> raise (Anomaly
+      ("evaluating size of '" ^ printable_type t ^ "'"))
+
+(* recursively computes size and offset of a structure and
+   its fields *)
+let rec define_sizeof s =
+  s.s_size <- List.fold_left define_ofs 0 s.s_ordered_fields
+
+and define_ofs acc ({f_typ} as field) =
+  field.f_ofs <- acc; if sizeof f_typ = 0 
+    then begin match f_typ with
+      | Tstruct s -> define_sizeof s
+      | t -> () (* cannot happen *)
+    end;
+    acc + (sizeof f_typ)
+
+(* returns a list of typed parameters for a given function, as a list of vars *)
+let rec build_parameters structures f_name used_names counter = function
+  | [] -> []
+  | ({id; loc}, ptyp) :: q -> if List.mem id used_names
+      then raise (Error (loc, "function '" ^ f_name ^
+        "': redefinition of parameter '" ^ id ^ "'"))
+      else begin
+        let typ = find_type structures ptyp in
+        let v = new_var id loc typ ~used:true in v.v_addr <- 8 * counter;
+        v :: build_parameters structures f_name (id :: used_names) (counter + 1) q
+      end
+
+(* types and adds a list of fields to a given structure, returns the ordered
+   list of all fields. *)
+let rec add_fields structure_context structure used_names = function
+  | [] -> []
+  | ({id; loc}, ptyp) :: q -> if List.mem id used_names
+      then raise (Error (loc, "structure '" ^ structure.s_name ^
+        "': redefinition of field '" ^ id ^ "'"))
+      else begin
+        let typ = find_type structure_context ptyp in
+        let field = {f_name=id; f_typ=typ; f_ofs=0} in
+        Hashtbl.add structure.s_fields id field;
+        field :: add_fields structure_context structure (id :: used_names) q
+      end
+
 
 (* 2. declare functions and type fields *)
-let phase2 = function
-  | PDfunction { pf_name={id; loc}; pf_params=pl; pf_typ=tyl; pf_body = body} ->
-   (if id = "main" 
-      then (found_main := true; 
-      if List.length pl <> 0 then error loc ("function main should not take arguments");
-      if List.length tyl <> 0 then error loc ("function main should return nothing")))
-  | PDstruct { ps_name = {id}; ps_fields = fl } ->
-     (* TODO *) () 
+(* only creates function mappings while editing structure fields *)
+let phase2 structures functions = function
+  | PDfunction {pf_name={id; loc}; pf_params=pl; pf_typ=tyl} ->
+      if id = "main" && pl = [] && tyl = [] then found_main := true;
+      if M.mem id functions
+        then raise (Error (loc, "function '" ^ id ^ "' already defined"));
+  (* why 2? both return address and previous %rbp value are on the stack *)
+      let fn_params = build_parameters structures id [] 2 pl in
+      let fn_typ = List.map (find_type structures) tyl in
+      M.add id {fn_name=id; fn_params; fn_typ} functions
+
+  | PDstruct {ps_name = {id; _}; ps_fields} ->
+      let s = M.find id structures in
+      s.s_ordered_fields <- add_fields structures s [] ps_fields;
+      functions
+
+exception Cyclic of string * string
+
+let cyclic_definition_detection structures =
+  let marks = Hashtbl.create 5 and fin = Hashtbl.create 5 in
+  let rec dfs {s_name; s_fields} = if not (Hashtbl.mem fin s_name) then begin
+    if Hashtbl.mem marks s_name
+      then raise (Cyclic (s_name, "has field of type '" ^ s_name ^ "'"))
+      else try
+        Hashtbl.add marks s_name ();
+        Hashtbl.iter (fun s -> function
+          | {f_typ=Tstruct structure} -> dfs structure
+          | _ -> ()
+        ) s_fields;
+        Hashtbl.add fin s_name ()
+      with
+        | Cyclic (orig, trail) when orig = s_name ->
+            raise (Error (dummy_loc, "cyclic definition:\n\tstructure '" ^ s_name ^ "' " ^ trail))
+        | Cyclic (orig, trail) ->
+            raise (Cyclic (orig, "has field of type '" ^ s_name ^ "'\n\twhich " ^ trail))
+  end in
+  M.iter (fun s -> dfs) structures
+        
 
 (* 3. type check function bodies *)
-let decl = function
-  | PDfunction { pf_name={id; loc}; pf_body = e; pf_typ=tyl } ->
-    (* TODO check name and type *) 
-    let f = { fn_name = id; fn_params = []; fn_typ = []} in
-    let e, rt = expr Env.empty e in
-    TDfunction (f, e)
-  | PDstruct {ps_name={id}} ->
-    (* TODO *) let s = { s_name = id; s_fields = Hashtbl.create 5; s_size = 0 } in
-     TDstruct s
+let decl structures functions = function
+  | PDfunction {pf_name={id; loc}; pf_body} ->
+    let f = M.find id functions in
+    let env = Env.new_env functions structures f in
+    let e, env' = expr env pf_body in
+    if f.fn_typ = [] || env'.returns
+      then TDfunction (f, e)
+      else raise (Error (loc, "missing return statements for function '" ^ id ^ "'"))
 
+  | PDstruct {ps_name={id}} ->
+    let s = M.find id structures in
+    define_sizeof s;
+    (* debug to print information on structures *)
+    if !debug then begin
+      print_string ("structure '" ^ id ^ "' has size "
+        ^ string_of_int (sizeof (Tstruct s)) ^ "\n");
+      List.iter (fun {f_name; f_ofs} ->
+        print_string ("\tfield '" ^ f_name ^ "' has offset "
+          ^ string_of_int f_ofs ^ "\n")) s.s_ordered_fields
+    end;
+    TDstruct s
+
+(* local variables (functions, structures) are used to represent context *)
 let file ~debug:b (imp, dl) =
   debug := b;
-  (* fmt_imported := imp; *)
-  List.iter phase1 dl;
-  List.iter phase2 dl;
-  if not !found_main then error dummy_loc "missing method main";
-  let dl = List.map decl dl in
-  Env.check_unused (); (* TODO variables non utilisees *)
-  if (imp && not !fmt_used) then error dummy_loc "fmt imported but not used";
-  if (not imp && !fmt_used) then error dummy_loc "fmt not imported but used";
+  fmt_imported := imp;
+
+  let structures = List.fold_left phase1 M.empty dl in
+  if !debug then print_string "PHASE 1 DONE\n";
+  let functions = List.fold_left (phase2 structures) M.empty dl in
+  if !debug then print_string "PHASE 2 DONE\n";
+  
+  if not !found_main then raise (Error (dummy_loc, "missing method main"));
+  cyclic_definition_detection structures;
+
+  let dl = List.map (decl structures functions) dl in
+  Env.check_unused (); 
+  if imp && not !fmt_used then raise (Error (dummy_loc, "fmt imported but not used"));
+  if !debug then print_string "PHASE 3 DONE\n";
   dl
